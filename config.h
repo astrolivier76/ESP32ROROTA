@@ -29,13 +29,7 @@ const int pinClosedSensor = 14; // Fin de course (NC): Toit Fermé
 const int pinSafeSensor   = 23; // Infrarouge OMRON (NPN): Signal de parking
 
 // ==========================================
-// 3. LOGIQUE MATÉRIELLE
-// ==========================================
-// Mettre LOW car le capteur NPN ferme le circuit à la masse quand le faisceau est aligné
-const int ETAT_SECURISE = LOW; 
-
-// ==========================================
-// 4. TIMEOUT MATÉRIEL
+// 3. TIMEOUT MATÉRIEL
 // ==========================================
 #define WDT_TIMEOUT 3
 #define TIMEOUT_MOUVEMENT 15000 // Temps maximum autorisé pour une manœuvre

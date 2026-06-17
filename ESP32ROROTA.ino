@@ -106,29 +106,40 @@ void transition(EtatToit e) {
 }
 
 // ===================== MAJ CAPTEURS ========================
+// ===================== MAJ CAPTEURS ========================
 void majCapteurs() {
-  // 1. PRIORITÉ ABSOLUE : SÉCURITÉ IPX800
-  if (capteurSafe.etatStable == SAFE_BLOCKED) {
-    if (etatCourant != ETAT_SAFE_BLOCKED) {
-      stopUrgence();
-      etatCourant = ETAT_SAFE_BLOCKED;
-    }
+  
+  // 1. AUTO-RÉARMEMENT : Le télescope vient de se re-parquer
+  if (etatCourant == ETAT_SAFE_BLOCKED && capteurSafe.etatStable == SAFE_OK) {
+    etatCourant = ETAT_INCONNU; // On lève l'erreur, le système va se recaler au prochain cycle
     return;
   }
 
-  // 2. PARADOXE MATÉRIEL : Les deux capteurs fin de course sont à LOW
+  // 2. PRIORITÉ ABSOLUE : SÉCURITÉ IPX800
+  if (capteurSafe.etatStable == SAFE_BLOCKED) {
+    // TOLÉRANCE : On ignore l'alerte uniquement si le toit est COMPLÈTEMENT ouvert
+    if (etatCourant != ETAT_OUVERT) {
+      if (etatCourant != ETAT_SAFE_BLOCKED) {
+        stopUrgence();
+        etatCourant = ETAT_SAFE_BLOCKED;
+      }
+    }
+    return; // On stoppe l'évaluation des autres capteurs car la sécurité prime ou on est en tolérance
+  }
+
+  // 3. PARADOXE MATÉRIEL : Les deux capteurs fin de course sont à LOW
   if (capteurOuvert.etatStable == LOW && capteurFerme.etatStable == LOW) {
     if (etatCourant != ETAT_ERREUR) {
-      transition(ETAT_ERREUR); 
+      transition(ETAT_ERREUR);
     }
     return;
   }
 
-  // 3. LECTURE NORMALE : Mise à jour de l'état
+  // 4. LECTURE NORMALE : Mise à jour de l'état
   if (capteurOuvert.etatStable == LOW) transition(ETAT_OUVERT);
   else if (capteurFerme.etatStable == LOW) transition(ETAT_FERME);
 
-  // 4. PERTE DE CAPTEUR ANORMALE (Toit physiquement poussé ou capteur arraché)
+  // 5. PERTE DE CAPTEUR ANORMALE (Toit physiquement poussé ou capteur arraché)
   if (etatCourant == ETAT_OUVERT && capteurOuvert.etatStable == HIGH) {
     transition(ETAT_ERREUR);
   }
@@ -189,6 +200,15 @@ void majRelais() {
 // ===================== ASCOM (RRCI V1.3.1) =================
 void ascom(String cmd) {
   cmd.trim();
+  String originalCmd = cmd; 
+  cmd.toLowerCase(); 
+
+  // --- TRACEUR POUR LE DÉBOGAGE ---
+  if (cmd != "status" && cmd != "ping") { 
+    Serial.print("[ASCOM] <-- NINA a dit : ");
+    Serial.println(originalCmd);
+  }
+
   if (cmd == "ping") {
     client.print("PONG#");
   }
@@ -212,39 +232,55 @@ void ascom(String cmd) {
     CommandeToit c = CMD_OUVRIR;
     xQueueSend(fileCommandes, &c, 0);
     client.print("OK:open#");
+    Serial.println(">>> ESP32 : J'exécute l'OUVERTURE demandée par ASCOM");
   }
   else if (cmd == "close") {
     CommandeToit c = CMD_FERMER;
     xQueueSend(fileCommandes, &c, 0);
     client.print("OK:close#");
+    Serial.println(">>> ESP32 : J'exécute la FERMETURE demandée par ASCOM");
   }
   else if (cmd == "abort") {
     CommandeToit c = CMD_RESET;
     xQueueSend(fileCommandes, &c, 0);
     client.print("OK:abort#");
+    Serial.println(">>> ESP32 : ABORT / RESET demandé par ASCOM !");
   }
-  else if (cmd.startsWith("setsafe") || cmd.startsWith("setmotion")) {
-    client.print("OK:");
-    client.print(cmd);
-    client.print("#");
+  else if (cmd.startsWith("setsafe")) {
+    client.print("OK:setsafe#"); // Parfaite imitation de l'original
+  }
+  else if (cmd.startsWith("setmotion")) {
+    client.print("OK:setmotion#"); // Parfaite imitation de l'original
+  }
+  else if (cmd.startsWith("setmode")) {
+    client.print("OK:setmode#"); // Ajout de la commande ignorée !
   }
   else if (cmd == "getpulsecount") {
     client.print("PULSES:0#");
   }
   else if (cmd == "resetpulse") {
-    client.print("OK:resetpulse#");
+    client.print("OK#"); // Correction selon le code d'origine
   }
   else {
     client.print("ERR:");
-    client.print(cmd);
+    client.print(originalCmd);
     client.print("#");
+    Serial.println(">>> ESP32 : ERREUR, commande ASCOM inconnue ignorée.");
   }
 }
 
 // ===================== TACHE SECURITE (Core 1) =============
 void codeSafe(void *p) {
-  esp_task_wdt_init(WDT_TIMEOUT, true);
+  
+  // Configuration du Watchdog matériel (Compatible Core ESP32 v3.0+)
+  esp_task_wdt_config_t twdt_config = {
+      .timeout_ms = WDT_TIMEOUT * 1000,
+      .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+      .trigger_panic = true,
+  };
+  esp_task_wdt_init(&twdt_config);
   esp_task_wdt_add(NULL);
+  
   CommandeToit c;
   for (;;) {
     lire(capteurOuvert);
@@ -258,7 +294,9 @@ void codeSafe(void *p) {
     majRelais();
     checkTimeout();
 
+    // On réinitialise le Watchdog à chaque cycle pour prouver que tout va bien
     esp_task_wdt_reset();
+
     vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 }
@@ -266,8 +304,7 @@ void codeSafe(void *p) {
 // ===================== TACHE NET & WEB (Core 0) ============
 void codeNet(void *p) {
   WiFi.begin(ssid, password);
-
-  // --- NOUVEAU BLOC : On attend la connexion et on affiche l'IP ---
+  // --- Attente connexion initiale ---
   while (WiFi.status() != WL_CONNECTED) {
     vTaskDelay(500 / portTICK_PERIOD_MS);
     Serial.print(".");
@@ -329,7 +366,6 @@ void codeNet(void *p) {
         <div id="badge-etat">CHARGEMENT...</div>
         
         <br><br>
-        <!-- NOUVEAUX BOUTONS AJAX -->
         <button onclick="envoyerCommande('/open')" class="btn btn-open">Ouvrir le Toit</button>
         <button onclick="envoyerCommande('/close')" class="btn btn-close">Fermer le Toit</button><br>
         <button onclick="envoyerCommande('/reset')" class="btn btn-reset">Acquitter Erreur (Reset)</button>
@@ -363,7 +399,7 @@ void codeNet(void *p) {
           xhr.open("GET", url, true);
           xhr.send();
           // Force une mise à jour immédiate du badge 200ms après le clic
-          setTimeout(rafraichirEtat, 200); 
+          setTimeout(rafraichirEtat, 200);
         }
 
         rafraichirEtat();
@@ -377,18 +413,21 @@ void codeNet(void *p) {
 
   // Actions Boutons (AJAX - Pas de rechargement de page)
   serverWeb.on("/open", []() {
+    Serial.println("[WEB] --> Demande d'OUVERTURE reçue");
     CommandeToit c = CMD_OUVRIR;
     xQueueSend(fileCommandes, &c, 0);
     serverWeb.send(200, "text/plain", "OK");
   });
 
   serverWeb.on("/close", []() {
+    Serial.println("[WEB] --> Demande de FERMETURE reçue");
     CommandeToit c = CMD_FERMER;
     xQueueSend(fileCommandes, &c, 0);
     serverWeb.send(200, "text/plain", "OK");
   });
 
   serverWeb.on("/reset", []() {
+    Serial.println("[WEB] --> Demande de RESET reçue");
     CommandeToit c = CMD_RESET;
     xQueueSend(fileCommandes, &c, 0);
     serverWeb.send(200, "text/plain", "OK");
@@ -455,9 +494,9 @@ void codeNet(void *p) {
           document.getElementById("status").innerHTML = event.target.responseText;
           document.getElementById("prg").value = 100;
           if (event.target.responseText.includes("ECHEC")) {
-             document.getElementById("status").style.color = "#e53e3e"; 
+             document.getElementById("status").style.color = "#e53e3e";
           } else {
-             document.getElementById("status").style.color = "#48bb78"; 
+             document.getElementById("status").style.color = "#48bb78";
           }
         }
         
@@ -496,26 +535,48 @@ void codeNet(void *p) {
   server.begin(); // Démarrage du serveur ASCOM (8888)
 
   for (;;) {
+    // --- 1. GESTION WIFI SILENCIEUSE ET ROBUSTE ---
     if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[WIFI] Déconnecté ! Tentative de reconnexion...");
       WiFi.disconnect();
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
       WiFi.begin(ssid, password);
-      vTaskDelay(2000 / portTICK_PERIOD_MS);
-      continue;
+      
+      // On attend sagement 5 secondes sans spammer
+      for (int i = 0; i < 50; i++) {
+        if (WiFi.status() == WL_CONNECTED) {
+          Serial.println("[WIFI] Reconnecté avec succès !");
+          break;
+        }
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+      }
+      continue; // On repasse au début de la boucle
     }
 
     serverWeb.handleClient();
 
-    if (!client || !client.connected()) client = server.available();
-    if (client && client.available()) {
-      char c = client.read();
-      if (c == '#') {
-        ascom(String(networkIn));
-        memset(networkIn, 0, sizeof(networkIn));
-        netIndex = 0;
-      } else if (netIndex < sizeof(networkIn) - 1) {
-        networkIn[netIndex++] = c;
+    // --- 2. GESTION ASCOM / TCP ULTRA RAPIDE ---
+    if (client) {
+      if (client.connected()) {
+        // "while" au lieu de "if" : on vide le tuyau d'un seul coup !
+        while (client.available()) {
+          char c = client.read();
+          if (c == '#') {
+            ascom(String(networkIn));
+            memset(networkIn, 0, sizeof(networkIn));
+            netIndex = 0;
+          } else if (netIndex < sizeof(networkIn) - 1) {
+            networkIn[netIndex++] = c;
+          }
+        }
+      } else {
+        // Sécurité critique : On ferme le tuyau si NINA s'en va
+        client.stop(); 
       }
+    } else {
+      client = server.available(); // On attend un nouveau client
     }
+
     vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 }
@@ -534,9 +595,32 @@ void setup() {
   pinMode(pinClosedSensor, INPUT_PULLUP);
   pinMode(pinSafeSensor, INPUT_PULLUP);
 
-  if (digitalRead(pinOpenedSensor) == LOW) etatCourant = ETAT_OUVERT;
-  else if (digitalRead(pinClosedSensor) == LOW) etatCourant = ETAT_FERME;
-  else etatCourant = ETAT_INCONNU;
+  // --- NOUVEAU : Pré-chargement pour éviter la fausse alerte du debounce ---
+  capteurSafe.etatStable = digitalRead(pinSafeSensor);
+  capteurSafe.dernier = capteurSafe.etatStable;
+  
+  capteurOuvert.etatStable = digitalRead(pinOpenedSensor);
+  capteurOuvert.dernier = capteurOuvert.etatStable;
+  
+  capteurFerme.etatStable = digitalRead(pinClosedSensor);
+  capteurFerme.dernier = capteurFerme.etatStable;
+
+  // --- Lecture intiale protégée ---
+  if (capteurSafe.etatStable == SAFE_BLOCKED) {
+    etatCourant = ETAT_SAFE_BLOCKED;
+  }
+  else if (capteurOuvert.etatStable == LOW && capteurFerme.etatStable == LOW) {
+    etatCourant = ETAT_ERREUR;
+  }
+  else if (capteurOuvert.etatStable == LOW) {
+    etatCourant = ETAT_OUVERT;
+  }
+  else if (capteurFerme.etatStable == LOW) {
+    etatCourant = ETAT_FERME;
+  }
+  else {
+    etatCourant = ETAT_INCONNU;
+  }
 
   fileCommandes = xQueueCreate(10, sizeof(CommandeToit));
   xTaskCreatePinnedToCore(codeNet, "NET", 10000, NULL, 1, NULL, 0);
