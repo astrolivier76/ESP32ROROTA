@@ -107,6 +107,7 @@ void transition(EtatToit e) {
 
 // ===================== MAJ CAPTEURS ========================
 void majCapteurs() {
+  // 1. PRIORITÉ ABSOLUE : SÉCURITÉ IPX800
   if (capteurSafe.etatStable == SAFE_BLOCKED) {
     if (etatCourant != ETAT_SAFE_BLOCKED) {
       stopUrgence();
@@ -115,9 +116,19 @@ void majCapteurs() {
     return;
   }
 
-  if (capteurOuvert.etatStable == LOW) transition(ETAT_OUVERT);
-  if (capteurFerme.etatStable == LOW) transition(ETAT_FERME);
+  // 2. PARADOXE MATÉRIEL : Les deux capteurs fin de course sont à LOW
+  if (capteurOuvert.etatStable == LOW && capteurFerme.etatStable == LOW) {
+    if (etatCourant != ETAT_ERREUR) {
+      transition(ETAT_ERREUR); 
+    }
+    return;
+  }
 
+  // 3. LECTURE NORMALE : Mise à jour de l'état
+  if (capteurOuvert.etatStable == LOW) transition(ETAT_OUVERT);
+  else if (capteurFerme.etatStable == LOW) transition(ETAT_FERME);
+
+  // 4. PERTE DE CAPTEUR ANORMALE (Toit physiquement poussé ou capteur arraché)
   if (etatCourant == ETAT_OUVERT && capteurOuvert.etatStable == HIGH) {
     transition(ETAT_ERREUR);
   }
@@ -254,11 +265,16 @@ void codeSafe(void *p) {
 
 // ===================== TACHE NET & WEB (Core 0) ============
 void codeNet(void *p) {
-  // Connexion Wi-Fi (DHCP géré par le routeur)
   WiFi.begin(ssid, password);
+
+  // --- NOUVEAU BLOC : On attend la connexion et on affiche l'IP ---
   while (WiFi.status() != WL_CONNECTED) {
     vTaskDelay(500 / portTICK_PERIOD_MS);
+    Serial.print(".");
   }
+  Serial.println("");
+  Serial.print("Connecté au Wi-Fi ! IP : ");
+  Serial.println(WiFi.localIP());
 
   // --- INITIALISATION mDNS ---
   if (MDNS.begin(mdns_name)) {
@@ -275,13 +291,13 @@ void codeNet(void *p) {
       case ETAT_EN_OUVERTURE:   etatStr = "EN OUVERTURE..."; break;
       case ETAT_EN_FERMETURE:   etatStr = "EN FERMETURE..."; break;
       case ETAT_ERREUR:         etatStr = "ERREUR CAPTEUR / TIMEOUT"; break;
-      case ETAT_SAFE_BLOCKED:   etatStr = "SÉCURITÉ TOIT BLOQUÉ (IPX800)"; break;
+      case ETAT_SAFE_BLOCKED:   etatStr = "SÉCURITÉ TOIT BLOQUÉE (IPX800)"; break;
       default:                  etatStr = "INCONNU"; break;
     }
     serverWeb.send(200, "text/plain", etatStr);
   });
 
-  // Page d'accueil principale dynamique
+  // Page d'accueil principale dynamique avec AJAX
   serverWeb.on("/", HTTP_GET, []() {
     serverWeb.sendHeader("Connection", "close");
     String html = R"rawliteral(
@@ -313,9 +329,10 @@ void codeNet(void *p) {
         <div id="badge-etat">CHARGEMENT...</div>
         
         <br><br>
-        <a href="/open" class="btn btn-open">Ouvrir le Toit</a>
-        <a href="/close" class="btn btn-close">Fermer le Toit</a><br>
-        <a href="/reset" class="btn btn-reset">Acquitter Erreur (Reset)</a>
+        <!-- NOUVEAUX BOUTONS AJAX -->
+        <button onclick="envoyerCommande('/open')" class="btn btn-open">Ouvrir le Toit</button>
+        <button onclick="envoyerCommande('/close')" class="btn btn-close">Fermer le Toit</button><br>
+        <button onclick="envoyerCommande('/reset')" class="btn btn-reset">Acquitter Erreur (Reset)</button>
         <br><br>
         <a href="/update" class="btn btn-ota" style="font-size:12px;">Mise à jour Firmware (OTA)</a>
       </div>
@@ -339,6 +356,16 @@ void codeNet(void *p) {
           };
           xhr.send();
         }
+
+        // Envoi des commandes en arrière-plan (AJAX)
+        function envoyerCommande(url) {
+          var xhr = new XMLHttpRequest();
+          xhr.open("GET", url, true);
+          xhr.send();
+          // Force une mise à jour immédiate du badge 200ms après le clic
+          setTimeout(rafraichirEtat, 200); 
+        }
+
         rafraichirEtat();
         setInterval(rafraichirEtat, 2000);
       </script>
@@ -348,26 +375,23 @@ void codeNet(void *p) {
     serverWeb.send(200, "text/html", html);
   });
 
-  // Actions Boutons (Redirige vers l'accueil après clic)
+  // Actions Boutons (AJAX - Pas de rechargement de page)
   serverWeb.on("/open", []() {
     CommandeToit c = CMD_OUVRIR;
     xQueueSend(fileCommandes, &c, 0);
-    serverWeb.sendHeader("Location", "/");
-    serverWeb.send(303);
+    serverWeb.send(200, "text/plain", "OK");
   });
 
   serverWeb.on("/close", []() {
     CommandeToit c = CMD_FERMER;
     xQueueSend(fileCommandes, &c, 0);
-    serverWeb.sendHeader("Location", "/");
-    serverWeb.send(303);
+    serverWeb.send(200, "text/plain", "OK");
   });
 
   serverWeb.on("/reset", []() {
     CommandeToit c = CMD_RESET;
     xQueueSend(fileCommandes, &c, 0);
-    serverWeb.sendHeader("Location", "/");
-    serverWeb.send(303);
+    serverWeb.send(200, "text/plain", "OK");
   });
 
   // Interface Web OTA avec Barre de progression
@@ -520,6 +544,48 @@ void setup() {
 }
 
 // ===================== LOOP ================================
+EtatToit dernierEtatAffiche = ETAT_INCONNU; // A supprimer lors de la compilation finale sans loop()
+
 void loop() {
-  vTaskDelete(NULL);
+//  vTaskDelete(NULL); a decommmenter une fois les tests realisés sur breadboard
+
+// bloc de test sur breadboard
+
+  // 1. Affichage en temps réel des changements d'état
+  if (etatCourant != dernierEtatAffiche) {
+    dernierEtatAffiche = etatCourant;
+    Serial.print(">>> STATUT TOIT : ");
+    switch(etatCourant) {
+      case ETAT_FERME:          Serial.println("FERMÉ"); break;
+      case ETAT_OUVERT:         Serial.println("OUVERT"); break;
+      case ETAT_EN_OUVERTURE:   Serial.println("EN OUVERTURE..."); break;
+      case ETAT_EN_FERMETURE:   Serial.println("EN FERMETURE..."); break;
+      case ETAT_ERREUR:         Serial.println("ERREUR CAPTEUR / TIMEOUT !"); break;
+      case ETAT_SAFE_BLOCKED:   Serial.println("SÉCURITÉ BLOQUÉE (Vérifier IPX800) !"); break;
+      default:                  Serial.println("INCONNU"); break;
+    }
+  }
+
+  // 2. Écoute des commandes tapées au clavier
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'o' || c == 'O') {
+      CommandeToit cmd = CMD_OUVRIR;
+      xQueueSend(fileCommandes, &cmd, 0);
+      Serial.println("--> ORDRE ENVOYÉ : OUVRIR");
+    } 
+    else if (c == 'f' || c == 'F') {
+      CommandeToit cmd = CMD_FERMER;
+      xQueueSend(fileCommandes, &cmd, 0);
+      Serial.println("--> ORDRE ENVOYÉ : FERMER");
+    } 
+    else if (c == 'r' || c == 'R') {
+      CommandeToit cmd = CMD_RESET;
+      xQueueSend(fileCommandes, &cmd, 0);
+      Serial.println("--> ORDRE ENVOYÉ : RESET");
+    }
+  }
+// fin d'instertion bloc de test esp32
+  
+  vTaskDelay(50 / portTICK_PERIOD_MS); // Petite pause pour ne pas saturer le processeur
 }
