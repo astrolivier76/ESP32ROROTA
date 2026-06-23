@@ -10,9 +10,6 @@
 const char* ssid     = "maison_casba";
 const char* password = "casandepa76*";
 
-// Port du serveur TCP (à renseigner dans HW VSP3)
-const int portTCP = 8888;
-
 // Nom d'accès mDNS (ex: http://toit-astro.local)
 const char* mdns_name = "esp32-toit";
 

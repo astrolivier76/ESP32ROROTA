@@ -1,6 +1,6 @@
 // ==========================================================
 // Motorisation Observatoire ESP32 + Web OTA + ASCOM ALPACA
-// Architecture Fail-Safe & Ultra-Haute Performance (VMATÉRIEL STABLE)
+// Architecture Fail-Safe, Haute Performance & Conformité ASCOM
 // ==========================================================
 
 #include <WiFi.h>
@@ -10,13 +10,13 @@
 #include <Update.h>
 #include "config.h"
 
-// ===================== RÉSEAU =============================
-WiFiServer server(portTCP); // Ancien ASCOM
-WebServer serverWeb(80);    // Web, OTA & Alpaca
-WiFiClient client;
+// ============= Variables de comptage requetes =============
+volatile int compteurRequetes = 0;
+unsigned long chronoRequetes = 0;
 
-char networkIn[64];
-uint8_t netIndex = 0;
+// ===================== RÉSEAU & ASCOM =====================
+WebServer serverWeb(80);    // Web, OTA & Alpaca
+volatile uint32_t serverTransactionID = 1; // Compteur obligatoire pour Alpaca
 
 // ===================== ETATS ===============================
 enum EtatToit {
@@ -25,7 +25,8 @@ enum EtatToit {
   ETAT_ERREUR, ETAT_SAFE_BLOCKED
 };
 
-enum CommandeToit { CMD_AUCUNE, CMD_OUVRIR, CMD_FERMER, CMD_RESET };
+// Séparation claire entre ABORT (arrêt d'urgence) et RESET (acquittement)
+enum CommandeToit { CMD_AUCUNE, CMD_OUVRIR, CMD_FERMER, CMD_ABORT, CMD_RESET };
 
 volatile EtatToit etatCourant = ETAT_INCONNU;
 QueueHandle_t fileCommandes;
@@ -93,11 +94,19 @@ void majCapteurs() {
 }
 
 void exec(CommandeToit c) {
-  if (etatCourant == ETAT_SAFE_BLOCKED || etatCourant == ETAT_ERREUR) {
-    if (c == CMD_RESET) { stopUrgence(); etatCourant = ETAT_INCONNU; }
+  if (c == CMD_ABORT) {
+    stopUrgence();
+    // Si on était en mouvement, on est maintenant bloqué au milieu de nulle part
+    if (etatCourant == ETAT_EN_OUVERTURE || etatCourant == ETAT_EN_FERMETURE) etatCourant = ETAT_INCONNU;
     return;
   }
-  if (c == CMD_RESET) { stopUrgence(); etatCourant = ETAT_INCONNU; return; }
+  if (c == CMD_RESET) { 
+    stopUrgence(); 
+    etatCourant = ETAT_INCONNU; // Acquitte l'erreur
+    return; 
+  }
+  
+  if (etatCourant == ETAT_SAFE_BLOCKED || etatCourant == ETAT_ERREUR) return;
 
   if (c == CMD_OUVRIR && etatCourant == ETAT_FERME) {
     digitalWrite(pinCloseRelay, LOW); digitalWrite(pinOpenRelay, HIGH);
@@ -119,25 +128,6 @@ void majRelais() {
   if (millis() - timerRelais > 1000) { digitalWrite(pinOpenRelay, LOW); digitalWrite(pinCloseRelay, LOW); }
 }
 
-// ===================== ANCIEN ASCOM TCP =====================
-void ascom(String cmd) {
-  cmd.trim(); String originalCmd = cmd; cmd.toLowerCase();
-  if (cmd == "ping") client.print("PONG#");
-  else if (cmd == "status") {
-    String resp = "STATE:";
-    if (etatCourant == ETAT_OUVERT) resp += "OPEN;"; else if (etatCourant == ETAT_FERME) resp += "CLOSED;";
-    else if (etatCourant == ETAT_EN_OUVERTURE) resp += "OPENING;"; else if (etatCourant == ETAT_EN_FERMETURE) resp += "CLOSING;";
-    else if (etatCourant == ETAT_ERREUR || etatCourant == ETAT_SAFE_BLOCKED) resp += "ERROR;"; else resp += "IDLE;";
-    resp += (capteurSafe.etatStable == SAFE_OK) ? "SAFE;" : "UNSAFE;";
-    if (etatCourant == ETAT_EN_OUVERTURE || etatCourant == ETAT_EN_FERMETURE) resp += "MOVING#"; else resp += "IDLE#";
-    client.print(resp);
-  }
-  else if (cmd == "open") { CommandeToit c = CMD_OUVRIR; xQueueSend(fileCommandes, &c, 0); client.print("OK:open#"); }
-  else if (cmd == "close") { CommandeToit c = CMD_FERMER; xQueueSend(fileCommandes, &c, 0); client.print("OK:close#"); }
-  else if (cmd == "abort") { CommandeToit c = CMD_RESET; xQueueSend(fileCommandes, &c, 0); client.print("OK:abort#"); }
-  else client.print("OK#");
-}
-
 // ===================== TACHE SECURITE ======================
 void codeSafe(void *p) {
   esp_task_wdt_config_t twdt_config = { .timeout_ms = WDT_TIMEOUT * 1000, .idle_core_mask = (1 << portNUM_PROCESSORS) - 1, .trigger_panic = true, };
@@ -154,13 +144,17 @@ void codeSafe(void *p) {
 
 // ===================== MOTEUR ALPACA ULTRA-LÉGER =====================
 void sendAlpaca(const char* value, int errNum = 0, const char* errMsg = "") {
+  //comptage requetes
+  compteurRequetes++;
+  //fin de comptage
   char buf[300];
   unsigned long cid = serverWeb.hasArg("ClientTransactionID") ? serverWeb.arg("ClientTransactionID").toInt() : 0;
+  uint32_t sid = serverTransactionID++; // Incrémentation propre à ASCOM
   
   if (value != nullptr) {
-    snprintf(buf, sizeof(buf), "{\"Value\":%s,\"ClientTransactionID\":%lu,\"ServerTransactionID\":1,\"ErrorNumber\":%d,\"ErrorMessage\":\"%s\"}", value, cid, errNum, errMsg);
+    snprintf(buf, sizeof(buf), "{\"Value\":%s,\"ClientTransactionID\":%lu,\"ServerTransactionID\":%lu,\"ErrorNumber\":%d,\"ErrorMessage\":\"%s\"}", value, cid, sid, errNum, errMsg);
   } else {
-    snprintf(buf, sizeof(buf), "{\"ClientTransactionID\":%lu,\"ServerTransactionID\":1,\"ErrorNumber\":%d,\"ErrorMessage\":\"%s\"}", cid, errNum, errMsg);
+    snprintf(buf, sizeof(buf), "{\"ClientTransactionID\":%lu,\"ServerTransactionID\":%lu,\"ErrorNumber\":%d,\"ErrorMessage\":\"%s\"}", cid, sid, errNum, errMsg);
   }
   
   serverWeb.sendHeader("Connection", "close"); 
@@ -196,6 +190,9 @@ void codeNet(void *p) {
   serverWeb.on("/api/v1/dome/0/driverversion", HTTP_GET, []() { sendAlpaca("\"1.0\""); });
   serverWeb.on("/api/v1/dome/0/interfaceversion", HTTP_GET, []() { sendAlpaca("1"); });
   serverWeb.on("/api/v1/dome/0/supportedactions", HTTP_GET, []() { sendAlpaca("[]"); });
+  
+  // NOUVEAU : Propriété Connecting commune à l'API Alpaca
+  serverWeb.on("/api/v1/dome/0/connecting", HTTP_GET, []() { sendAlpaca("false"); });
 
   // --- ASCOM ALPACA : DOME PROPRIÉTÉS ---
   serverWeb.on("/api/v1/dome/0/connected", HTTP_GET, []() { sendAlpaca(isAlpacaConnected ? "true" : "false"); });
@@ -217,7 +214,7 @@ void codeNet(void *p) {
   serverWeb.on("/api/v1/dome/0/azimuth", HTTP_GET, []() { sendAlpaca("0"); });
 
   serverWeb.on("/api/v1/dome/0/canfindhome", HTTP_GET, []() { sendAlpaca("false"); });
-  serverWeb.on("/api/v1/dome/0/canpark", HTTP_GET, []() { sendAlpaca("false"); });
+  serverWeb.on("/api/v1/dome/0/canpark", HTTP_GET, []() { sendAlpaca("true"); }); // Autorisé pour fermer le toit
   serverWeb.on("/api/v1/dome/0/cansetshutter", HTTP_GET, []() { sendAlpaca("true"); });
   serverWeb.on("/api/v1/dome/0/cansetaltitude", HTTP_GET, []() { sendAlpaca("false"); });
   serverWeb.on("/api/v1/dome/0/cansetazimuth", HTTP_GET, []() { sendAlpaca("false"); });
@@ -226,27 +223,64 @@ void codeNet(void *p) {
   serverWeb.on("/api/v1/dome/0/cansetpark", HTTP_GET, []() { sendAlpaca("false"); });
 
   // --- ASCOM ALPACA : DOME ACTIONS ---
-  serverWeb.on("/api/v1/dome/0/openshutter", HTTP_PUT, []() { CommandeToit c = CMD_OUVRIR; xQueueSend(fileCommandes, &c, 0); sendAlpaca(nullptr); });
-  serverWeb.on("/api/v1/dome/0/closeshutter", HTTP_PUT, []() { CommandeToit c = CMD_FERMER; xQueueSend(fileCommandes, &c, 0); sendAlpaca(nullptr); });
-  serverWeb.on("/api/v1/dome/0/abortslew", HTTP_PUT, []() { CommandeToit c = CMD_RESET; xQueueSend(fileCommandes, &c, 0); sendAlpaca(nullptr); });
+  serverWeb.on("/api/v1/dome/0/openshutter", HTTP_PUT, []() { 
+    CommandeToit c = CMD_OUVRIR; 
+    if(xQueueSend(fileCommandes, &c, 0) == pdPASS) sendAlpaca(nullptr); 
+    else sendAlpaca(nullptr, 1024, "File d'attente pleine");
+  });
+  serverWeb.on("/api/v1/dome/0/closeshutter", HTTP_PUT, []() { 
+    CommandeToit c = CMD_FERMER; 
+    if(xQueueSend(fileCommandes, &c, 0) == pdPASS) sendAlpaca(nullptr); 
+    else sendAlpaca(nullptr, 1024, "File d'attente pleine");
+  });
+  serverWeb.on("/api/v1/dome/0/park", HTTP_PUT, []() { 
+    CommandeToit c = CMD_FERMER; // Mapper Park à la fermeture
+    if(xQueueSend(fileCommandes, &c, 0) == pdPASS) sendAlpaca(nullptr); 
+    else sendAlpaca(nullptr, 1024, "File d'attente pleine");
+  });
+  serverWeb.on("/api/v1/dome/0/abortslew", HTTP_PUT, []() { 
+    CommandeToit c = CMD_ABORT; 
+    if(xQueueSend(fileCommandes, &c, 0) == pdPASS) sendAlpaca(nullptr); 
+    else sendAlpaca(nullptr, 1024, "File d'attente pleine");
+  });
 
   serverWeb.on("/api/v1/dome/0/slaved", HTTP_PUT, []() { sendAlpaca(nullptr, 1024, "Non applicable"); });
   serverWeb.on("/api/v1/dome/0/setpark", HTTP_PUT, []() { sendAlpaca(nullptr, 1024, "Non applicable"); });
-  serverWeb.on("/api/v1/dome/0/park", HTTP_PUT, []() { sendAlpaca(nullptr, 1024, "Utilisez CloseShutter"); });
   serverWeb.on("/api/v1/dome/0/findhome", HTTP_PUT, []() { sendAlpaca(nullptr, 1024, "Non applicable"); });
   serverWeb.on("/api/v1/dome/0/slewtoazimuth", HTTP_PUT, []() { sendAlpaca(nullptr, 1024, "Non applicable"); });
   serverWeb.on("/api/v1/dome/0/syncazimuth", HTTP_PUT, []() { sendAlpaca(nullptr, 1024, "Non applicable"); });
   serverWeb.on("/api/v1/dome/0/slewtoaltitude", HTTP_PUT, []() { sendAlpaca(nullptr, 1024, "Non applicable"); });
 
   // --- ACTIONS WEB MANUELLES ---
-  serverWeb.on("/open", []() { CommandeToit c = CMD_OUVRIR; xQueueSend(fileCommandes, &c, 0); serverWeb.sendHeader("Connection", "close"); serverWeb.send(200, "text/plain", "OK"); });
-  serverWeb.on("/close", []() { CommandeToit c = CMD_FERMER; xQueueSend(fileCommandes, &c, 0); serverWeb.sendHeader("Connection", "close"); serverWeb.send(200, "text/plain", "OK"); });
-  serverWeb.on("/reset", []() { CommandeToit c = CMD_RESET; xQueueSend(fileCommandes, &c, 0); serverWeb.sendHeader("Connection", "close"); serverWeb.send(200, "text/plain", "OK"); });
+  serverWeb.on("/open", []() { 
+    CommandeToit c = CMD_OUVRIR; 
+    serverWeb.sendHeader("Connection", "close"); 
+    if(xQueueSend(fileCommandes, &c, 0) == pdPASS) serverWeb.send(200, "text/plain", "OK"); 
+    else serverWeb.send(503, "text/plain", "BUSY");
+  });
+  serverWeb.on("/close", []() { 
+    CommandeToit c = CMD_FERMER; 
+    serverWeb.sendHeader("Connection", "close"); 
+    if(xQueueSend(fileCommandes, &c, 0) == pdPASS) serverWeb.send(200, "text/plain", "OK");
+    else serverWeb.send(503, "text/plain", "BUSY");
+  });
+  serverWeb.on("/abort", []() { 
+    CommandeToit c = CMD_ABORT; 
+    serverWeb.sendHeader("Connection", "close"); 
+    if(xQueueSend(fileCommandes, &c, 0) == pdPASS) serverWeb.send(200, "text/plain", "OK");
+    else serverWeb.send(503, "text/plain", "BUSY");
+  });
+  serverWeb.on("/reset", []() { 
+    CommandeToit c = CMD_RESET; 
+    serverWeb.sendHeader("Connection", "close"); 
+    if(xQueueSend(fileCommandes, &c, 0) == pdPASS) serverWeb.send(200, "text/plain", "OK");
+    else serverWeb.send(503, "text/plain", "BUSY");
+  });
 
   // --- PAGE D'ACCUEIL ---
   serverWeb.on("/", HTTP_GET, []() {
     serverWeb.sendHeader("Connection", "close");
-    serverWeb.send(200, "text/html", R"rawliteral(<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'><style>body{background:#111;color:#eee;text-align:center;padding:30px;font-family:sans-serif;}.card{background:#222;padding:30px;border-radius:10px;display:inline-block;border:1px solid #444;width:80%;max-width:500px;}.btn{padding:12px 24px;margin:10px;color:#fff;border:none;border-radius:6px;font-weight:bold;cursor:pointer;font-size:16px;text-decoration:none;display:inline-block;}.btn-open{background:#2f855a;}.btn-open:hover{background:#276749;}.btn-close{background:#c53030;}.btn-close:hover{background:#9b2c2c;}.btn-reset{background:#dd6b20;}.btn-reset:hover{background:#c05621;}.btn-ota{background:#4a5568;}.btn-ota:hover{background:#2d3748;}#badge-etat{padding:8px 15px;border-radius:20px;font-weight:bold;background:#4a5568;display:inline-block;margin-top:15px;}.moving{background:#dd6b20 !important;color:#fff;}.open{background:#38a169 !important;color:#fff;}.close{background:#e53e3e !important;color:#fff;}</style></head><body><div class="card"><h2>Contrôle de l'Abri Astro</h2><hr style="border-color:#444;"><p>État actuel du toit :</p><div id="badge-etat">CHARGEMENT...</div><br><br><button onclick="envoyerCommande('/open')" class="btn btn-open">Ouvrir le Toit</button><button onclick="envoyerCommande('/close')" class="btn btn-close">Fermer le Toit</button><br><button onclick="envoyerCommande('/reset')" class="btn btn-reset">Acquitter Erreur (Reset)</button><br><br><a href="/update" class="btn btn-ota" style="font-size:12px;">Mise à jour Firmware (OTA)</a></div><script>function rafraichirEtat(){var xhr=new XMLHttpRequest();xhr.open("GET","/api/status",true);xhr.onload=function(){if(xhr.status===200){var etat=xhr.responseText;var badge=document.getElementById("badge-etat");badge.innerHTML=etat;badge.className="";if(etat.includes("OUVERT")&&!etat.includes("EN"))badge.classList.add("open");else if(etat.includes("FERMÉ")&&!etat.includes("EN"))badge.classList.add("close");else if(etat.includes("EN"))badge.classList.add("moving");else badge.classList.add("moving");}};xhr.send();}function envoyerCommande(url){var xhr=new XMLHttpRequest();xhr.open("GET",url,true);xhr.send();setTimeout(rafraichirEtat,200);}rafraichirEtat();setInterval(rafraichirEtat,500);</script></body></html>)rawliteral");
+    serverWeb.send(200, "text/html", R"rawliteral(<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'><style>body{background:#111;color:#eee;text-align:center;padding:30px;font-family:sans-serif;}.card{background:#222;padding:30px;border-radius:10px;display:inline-block;border:1px solid #444;width:80%;max-width:500px;}.btn{padding:12px 24px;margin:10px;color:#fff;border:none;border-radius:6px;font-weight:bold;cursor:pointer;font-size:16px;text-decoration:none;display:inline-block;}.btn-open{background:#2f855a;}.btn-open:hover{background:#276749;}.btn-close{background:#c53030;}.btn-close:hover{background:#9b2c2c;}.btn-abort{background:#e53e3e;}.btn-abort:hover{background:#c53030;}.btn-reset{background:#dd6b20;}.btn-reset:hover{background:#c05621;}.btn-ota{background:#4a5568;}.btn-ota:hover{background:#2d3748;}#badge-etat{padding:8px 15px;border-radius:20px;font-weight:bold;background:#4a5568;display:inline-block;margin-top:15px;}.moving{background:#dd6b20 !important;color:#fff;}.open{background:#38a169 !important;color:#fff;}.close{background:#e53e3e !important;color:#fff;}</style></head><body><div class="card"><h2>Contrôle de l'Abri Astro</h2><hr style="border-color:#444;"><p>État actuel du toit :</p><div id="badge-etat">CHARGEMENT...</div><br><br><button onclick="envoyerCommande('/open')" class="btn btn-open">Ouvrir</button><button onclick="envoyerCommande('/close')" class="btn btn-close">Fermer</button><button onclick="envoyerCommande('/abort')" class="btn btn-abort">Stop</button><br><button onclick="envoyerCommande('/reset')" class="btn btn-reset">Acquitter Erreur</button><br><br><a href="/update" class="btn btn-ota" style="font-size:12px;">Mise à jour Firmware (OTA)</a></div><script>function rafraichirEtat(){var xhr=new XMLHttpRequest();xhr.open("GET","/api/status",true);xhr.onload=function(){if(xhr.status===200){var etat=xhr.responseText;var badge=document.getElementById("badge-etat");badge.innerHTML=etat;badge.className="";if(etat.includes("OUVERT")&&!etat.includes("EN"))badge.classList.add("open");else if(etat.includes("FERMÉ")&&!etat.includes("EN"))badge.classList.add("close");else if(etat.includes("EN"))badge.classList.add("moving");else badge.classList.add("moving");}};xhr.send();}function envoyerCommande(url){var xhr=new XMLHttpRequest();xhr.open("GET",url,true);xhr.send();setTimeout(rafraichirEtat,200);}rafraichirEtat();setInterval(rafraichirEtat,500);</script></body></html>)rawliteral");
   });
 
   // --- MISE A JOUR OTA ---
@@ -269,7 +303,6 @@ void codeNet(void *p) {
   serverWeb.onNotFound([]() { sendAlpaca(nullptr, 1024, "Endpoint non implemente"); });
 
   serverWeb.begin();
-  server.begin(); // ASCOM TCP (8888)
 
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) {
@@ -279,19 +312,6 @@ void codeNet(void *p) {
     }
     
     serverWeb.handleClient(); // Traitement Web instantané
-
-    if (client) {
-      if (client.connected()) {
-        while (client.available()) {
-          char c = client.read();
-          if (c == '#') { ascom(String(networkIn)); memset(networkIn, 0, sizeof(networkIn)); netIndex = 0; } 
-          else if (netIndex < sizeof(networkIn) - 1) networkIn[netIndex++] = c;
-        }
-      } else client.stop();
-    } else client = server.available();
-
-    // MODIFICATION CRITIQUE : On passe de 10ms à 1ms.
-    // L'ESP32 traite maintenant les requêtes 10x plus vite. La file d'attente ne peut plus se former.
     vTaskDelay(1 / portTICK_PERIOD_MS); 
   }
 }
@@ -324,18 +344,13 @@ void setup() {
 
 EtatToit dernierEtatAffiche = ETAT_INCONNU;
 void loop() {
-  if (etatCourant != dernierEtatAffiche) {
-    dernierEtatAffiche = etatCourant;
-    Serial.print(">>> STATUT TOIT : ");
-    switch(etatCourant) {
-      case ETAT_FERME: Serial.println("FERMÉ"); break;
-      case ETAT_OUVERT: Serial.println("OUVERT"); break;
-      case ETAT_EN_OUVERTURE: Serial.println("EN OUVERTURE..."); break;
-      case ETAT_EN_FERMETURE: Serial.println("EN FERMETURE..."); break;
-      case ETAT_ERREUR: Serial.println("ERREUR CAPTEUR / TIMEOUT !"); break;
-      case ETAT_SAFE_BLOCKED: Serial.println("SÉCURITÉ BLOQUÉE !"); break;
-      default: Serial.println("INCONNU"); break;
+  if (millis() - chronoRequetes >= 1000) {
+    if (compteurRequetes > 0) {
+      Serial.print("[CHARGE RÉSEAU] Requêtes Alpaca par seconde : ");
+      Serial.println(compteurRequetes);
+      compteurRequetes = 0; // On remet à zéro pour la seconde suivante
     }
+    chronoRequetes = millis();
   }
   vTaskDelay(50 / portTICK_PERIOD_MS);
 }
